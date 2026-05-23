@@ -5,7 +5,17 @@
   "private": true,
   "scripts": {
     "start": "node index.js",
-    "check": "node --check index.js && node --check src/app.js && node --check src/config.js && node --check src/liveExecutor.js"
+    "check": "node --check index.js && node --check src/app.js && node --check src/config.js && node --check src/liveExecutor.js",
+    "test:migration": "npm run check && node scripts/replay-candidates.js && node --test test/test-daily-report.js",
+    "test:phase1": "node --test test/test-token-authority.js test/test-candidate-scorer.js",
+    "test:phase2": "node --test test/test-holder-risk.js test/test-candidate-scorer.js test/test-token-authority.js",
+    "test:phase3": "node --test test/test-volume-fee-risk.js test/test-candidate-scorer.js test/test-holder-risk.js test/test-token-authority.js",
+    "test:phase4": "node --test test/test-fee-oracle.js test/test-candidate-scorer.js test/test-holder-risk.js test/test-volume-fee-risk.js test/test-token-authority.js",
+    "test:phase5": "node --test test/test-strategy-tier.js test/test-candidate-scorer.js test/test-fee-oracle.js test/test-holder-risk.js test/test-volume-fee-risk.js test/test-token-authority.js",
+    "test:phase6": "node --test test/test-probe-entry.js test/test-strategy-tier.js test/test-candidate-scorer.js",
+    "test:phase7": "node --test test/test-wallet-alpha.js test/test-candidate-scorer.js test/test-probe-entry.js",
+    "test:phase8": "node --test test/test-history.js test/test-wallet-alpha.js",
+    "replay:candidates": "node scripts/replay-candidates.js"
   },
   "dependencies": {
     "@solana/web3.js": "^1.98.4",
@@ -14,6 +24,7 @@
     "bs58": "^6.0.0",
     "dotenv": "^16.4.7",
     "node-telegram-bot-api": "^0.66.0",
-    "ws": "^8.18.0"
+    "ws": "^8.18.0",
+    "node-cron": "^3.0.3"
   }
 }
