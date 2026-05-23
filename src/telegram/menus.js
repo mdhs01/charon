@@ -5,6 +5,7 @@ import { savedWallets } from '../enrichment/wallets.js';
 import { gmgnStatusText } from '../enrichment/gmgn.js';
 import { formatPosition } from './format.js';
 import { ENABLE_LLM, LLM_API_KEY } from '../config.js';
+import { dryRunCapitalSummary } from '../shared/history.js';
 
 export function menuKeyboard() {
   return {
@@ -27,6 +28,7 @@ export function menuKeyboard() {
 
 export function filtersText() {
   const strat = activeStrategy();
+  const cap = dryRunCapitalSummary();
   return [
     `⚙️ <b>Charon Filters</b> (${escapeHtml(strat.name)})`,
     `Min claim fee: ${fmtSol(strat.min_fee_claim_sol)} SOL`,
@@ -115,6 +117,7 @@ export function filtersKeyboard() {
 
 export function agentText() {
   const strat = activeStrategy();
+  const cap = dryRunCapitalSummary();
   return [
     '🛶 <b>Charon Agent</b>',
     `Strategy: <b>${escapeHtml(strat.name)}</b>`,
@@ -128,6 +131,8 @@ export function agentText() {
     `Size: ${fmtSol(strat.position_size_sol)} SOL`,
     `TP/SL: ${fmtPct(strat.tp_percent)} / ${fmtPct(strat.sl_percent)}`,
     `Trailing: ${strat.trailing_enabled ? fmtPct(strat.trailing_percent) : 'off'}`,
+    `Reserve virtual: ${fmtSol(cap.reservedProfitSol)} SOL (${cap.enabled ? cap.reservePct + '%' : 'off'})`,
+    `Deployable PnL: ${fmtSol(cap.deployableBalanceSol)} SOL`,
   ].join('\n');
 }
 
@@ -192,6 +197,7 @@ export function positionsText() {
 
 export function strategyMenuText() {
   const strat = activeStrategy();
+  const cap = dryRunCapitalSummary();
   const all = allStrategies();
   const entryIcons = { immediate: '⚡', wait_for_dip: '📉', after_confirmation: '🧠' };
   return [
@@ -204,6 +210,8 @@ export function strategyMenuText() {
     `Size: ${fmtSol(strat.position_size_sol)} SOL`,
     `TP/SL: ${fmtPct(strat.tp_percent)} / ${fmtPct(strat.sl_percent)}`,
     `Trailing: ${strat.trailing_enabled ? fmtPct(strat.trailing_percent) : 'off'}`,
+    `Reserve virtual: ${fmtSol(cap.reservedProfitSol)} SOL (${cap.enabled ? cap.reservePct + '%' : 'off'})`,
+    `Deployable PnL: ${fmtSol(cap.deployableBalanceSol)} SOL`,
     `Max positions: ${strat.max_open_positions}`,
     strat.min_holders > 0 ? `Min holders: ${strat.min_holders}` : null,
     strat.max_ath_distance_pct < 0 ? `Max ATH distance: ${strat.max_ath_distance_pct}%` : null,
@@ -217,6 +225,7 @@ export function strategyMenuText() {
 
 export function strategyKeyboard() {
   const strat = activeStrategy();
+  const cap = dryRunCapitalSummary();
   const all = allStrategies();
   const selector = all.map(s => [{
     text: `${s.enabled ? '▶ ' : ''}${s.name}`,

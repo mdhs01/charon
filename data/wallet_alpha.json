@@ -1,0 +1,12 @@
+{
+  "wallets": {
+    "w1": {
+      "wins": 1,
+      "losses": 0,
+      "earlyWins": 1,
+      "quickDumps": 0,
+      "updatedAtMs": 1779564775424,
+      "score": 0.9
+    }
+  }
+}

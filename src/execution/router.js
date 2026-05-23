@@ -22,10 +22,12 @@ export async function executeLiveBuy(selectedRow, decision, batchId, rows = [], 
   if (balance < amountLamports + LIVE_MIN_SOL_RESERVE_LAMPORTS) {
     throw new Error(`Insufficient SOL balance. Need ${fmtSol((amountLamports + LIVE_MIN_SOL_RESERVE_LAMPORTS) / 1_000_000_000)} SOL including reserve.`);
   }
+  const observedPriorityFee = Number(selectedRow.candidate?.risk?.networkCongestion?.currentMicrolamports || 0);
   const swap = await executeJupiterSwap({
     inputMint: WSOL_MINT,
     outputMint: selectedRow.candidate.token.mint,
     amount: amountLamports,
+    priorityFeeMicroLamports: observedPriorityFee > 0 ? observedPriorityFee : null,
   });
   if (!swap.outputAmount) {
     swap.outputAmount = await fetchLiveTokenBalance(selectedRow.candidate.token.mint) || swap.outputAmount;
@@ -84,10 +86,12 @@ export async function executeConfirmedIntent(chatId, intentId) {
       db.prepare('UPDATE trade_intents SET status = ?, updated_at_ms = ? WHERE id = ?').run('rejected_insufficient_balance', now(), intentId);
       return bot.sendMessage(chatId, `Insufficient SOL balance. Need ${fmtSol((amountLamports + LIVE_MIN_SOL_RESERVE_LAMPORTS) / 1_000_000_000)} SOL.`, { parse_mode: 'HTML' });
     }
+    const observedPriorityFee = Number(freshRow.candidate?.risk?.networkCongestion?.currentMicrolamports || 0);
     const swap = await executeJupiterSwap({
       inputMint: WSOL_MINT,
       outputMint: freshRow.candidate.token.mint,
       amount: amountLamports,
+      priorityFeeMicroLamports: observedPriorityFee > 0 ? observedPriorityFee : null,
     });
     if (!swap.outputAmount) {
       swap.outputAmount = await fetchLiveTokenBalance(freshRow.candidate.token.mint) || swap.outputAmount;

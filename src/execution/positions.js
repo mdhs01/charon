@@ -1,4 +1,4 @@
-import { now, json } from '../utils.js';
+import { now, json, safeJson } from '../utils.js';
 import { numSetting, boolSetting, strategyById } from '../db/settings.js';
 import { db } from '../db/connection.js';
 import { firstPositiveNumber, marketCapFromGmgn, tokenPriceFromGmgn } from '../utils.js';
@@ -12,6 +12,9 @@ import { updateCandidateSnapshot } from '../db/candidates.js';
 import { trending } from '../signals/trending.js';
 import { executeLiveSell } from './router.js';
 import { sendPositionExit } from '../telegram/send.js';
+import { withExitObservability } from '../shared/observability.js';
+import { ENABLE_PROBE_ENTRY, PROBE_CONFIRM_MIN_PNL_PCT, PROBE_CONFIRM_MAX_AGE_MINUTES, PROBE_FAIL_EXIT_PCT } from '../config.js';
+import { updateWalletAlphaFromPosition } from '../shared/wallet-alpha.js';
 
 export async function freshEntryMarket(mint, candidate) {
   const gmgn = await fetchGmgnTokenInfo(mint, false);
@@ -122,12 +125,32 @@ export async function refreshPosition(position, { autoExit = true, jupiterPnl = 
     pnlPercent = Number(jupiterPnl.totalPnlPercentageNative);
     pnlSol = Number.isFinite(Number(jupiterPnl.totalPnlNative)) ? Number(jupiterPnl.totalPnlNative) : pnlSol;
   }
+
+  let exitReason = null;
+  const snap = safeJson(position.snapshot_json, {});
+  const probe = snap?.probe || { enabled: false };
+  if (ENABLE_PROBE_ENTRY && probe.enabled && !probe.addDone) {
+    const ageMin = (now() - Number(position.opened_at_ms || now())) / 60000;
+    const heavyRisk = (position.exit_reason || '').includes('holder_cluster_risk') || false;
+    if (!heavyRisk && pnlPercent >= PROBE_CONFIRM_MIN_PNL_PCT && ageMin <= PROBE_CONFIRM_MAX_AGE_MINUTES) {
+      const addSize = Math.max(0, Number(probe.plannedSizeSol || 0) - Number(position.size_sol || 0));
+      if (addSize > 0) {
+        db.prepare('UPDATE dry_run_positions SET size_sol = ? WHERE id = ?').run(Number(position.size_sol) + addSize, position.id);
+        db.prepare(`
+          INSERT INTO dry_run_trades (position_id, mint, side, at_ms, price, mcap, size_sol, token_amount_est, reason, payload_json)
+          VALUES (?, ?, 'buy', ?, ?, ?, ?, ?, 'PROBE_ADD', ?)
+        `).run(position.id, position.mint, now(), price, mcap, addSize, null, json({ probeAdd: true, pnlPercent, ageMin }));
+        db.prepare('UPDATE dry_run_positions SET snapshot_json = ? WHERE id = ?').run(json({ ...snap, probe: { ...probe, addDone: true, addAtMs: now() } }), position.id);
+      }
+    } else if (pnlPercent <= PROBE_FAIL_EXIT_PCT || ageMin > PROBE_CONFIRM_MAX_AGE_MINUTES) {
+      exitReason = 'PROBE_FAIL_EXIT';
+    }
+  }
   const tpHit = pnlPercent >= Number(position.tp_percent);
   const slHit = pnlPercent <= Number(position.sl_percent);
   const trailingArmed = position.trailing_armed || (position.trailing_enabled && tpHit);
   const trailDrop = highWaterMcap > 0 ? (Number(mcap) / highWaterMcap - 1) * 100 : 0;
   const trailingHit = trailingArmed && position.trailing_enabled && trailDrop <= -Math.abs(Number(position.trailing_percent));
-  let exitReason = null;
   let closed = false;
 
   // Max hold time check
@@ -179,6 +202,7 @@ export async function refreshPosition(position, { autoExit = true, jupiterPnl = 
   `).run(highWaterMcap, highWaterPrice, trailingArmed ? 1 : 0, position.id);
 
   if (exitReason && autoExit && position.execution_mode === 'live') {
+    const closedAtMs = now();
     if (sellInProgress.has(position.id)) return { ...position, exitReason: null };
     sellInProgress.add(position.id);
     let sell;
@@ -198,22 +222,25 @@ export async function refreshPosition(position, { autoExit = true, jupiterPnl = 
       SET status = 'closed', closed_at_ms = ?, exit_price = ?, exit_mcap = ?, exit_reason = ?,
           pnl_percent = ?, pnl_sol = ?, exit_signature = ?
       WHERE id = ?
-    `).run(now(), price, mcap, exitReason, finalPnlPercent, finalPnlSol, sell.signature, position.id);
+    `).run(closedAtMs, price, mcap, exitReason, finalPnlPercent, finalPnlSol, sell.signature, position.id);
     db.prepare(`
       INSERT INTO dry_run_trades (position_id, mint, side, at_ms, price, mcap, size_sol, token_amount_est, reason, payload_json)
       VALUES (?, ?, 'sell', ?, ?, ?, ?, ?, ?, ?)
-    `).run(position.id, position.mint, now(), price, mcap, position.size_sol, position.token_amount_est, exitReason, json({ pnlPercent: finalPnlPercent, pnlSol: finalPnlSol, receivedSol: receivedSol ?? null, sell }));
+    `).run(position.id, position.mint, closedAtMs, price, mcap, position.size_sol, position.token_amount_est, exitReason, json({ pnlPercent: finalPnlPercent, pnlSol: finalPnlSol, receivedSol: receivedSol ?? null, sell, observability: withExitObservability(position.observability || {}, { openedAtMs: position.opened_at_ms, closedAtMs, currentMarketCap: mcap }) }));
     closed = true;
+    updateWalletAlphaFromPosition({ candidate: snap?.candidate }, { won: pnlPercent > 0, early: (now() - Number(position.opened_at_ms || now())) < 10*60_000, quickDump: exitReason === 'PROBE_FAIL_EXIT' || exitReason === 'SL' });
+    updateWalletAlphaFromPosition({ candidate: snap?.candidate }, { won: finalPnlPercent > 0, early: (now() - Number(position.opened_at_ms || now())) < 10*60_000, quickDump: exitReason === 'PROBE_FAIL_EXIT' || exitReason === 'SL' });
   } else if (exitReason && autoExit) {
+    const closedAtMs = now();
     db.prepare(`
       UPDATE dry_run_positions
       SET status = 'closed', closed_at_ms = ?, exit_price = ?, exit_mcap = ?, exit_reason = ?, pnl_percent = ?, pnl_sol = ?
       WHERE id = ?
-    `).run(now(), price, mcap, exitReason, pnlPercent, pnlSol, position.id);
+    `).run(closedAtMs, price, mcap, exitReason, pnlPercent, pnlSol, position.id);
     db.prepare(`
       INSERT INTO dry_run_trades (position_id, mint, side, at_ms, price, mcap, size_sol, token_amount_est, reason, payload_json)
       VALUES (?, ?, 'sell', ?, ?, ?, ?, ?, ?, ?)
-    `).run(position.id, position.mint, now(), price, mcap, position.size_sol, position.token_amount_est, exitReason, json({ pnlPercent, pnlSol }));
+    `).run(position.id, position.mint, closedAtMs, price, mcap, position.size_sol, position.token_amount_est, exitReason, json({ pnlPercent, pnlSol, observability: withExitObservability(position.observability || {}, { openedAtMs: position.opened_at_ms, closedAtMs, currentMarketCap: mcap }) }));
     closed = true;
   }
   return {

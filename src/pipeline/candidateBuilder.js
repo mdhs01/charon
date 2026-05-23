@@ -5,6 +5,14 @@ import { fetchJupiterAsset, fetchJupiterHolders, fetchJupiterChartContext } from
 import { fetchSavedWalletExposure } from '../enrichment/wallets.js';
 import { fetchTwitterNarrative } from '../enrichment/twitter.js';
 import { gmgnLink } from '../format.js';
+import { readTokenAuthority } from '../shared/token-authority.js';
+import { buildObservability } from '../shared/observability.js';
+import { ENABLE_TOKEN_AUTHORITY_GUARD, REJECT_ACTIVE_MINT_AUTHORITY, ACTIVE_FREEZE_AUTHORITY_SCORE_PENALTY, HOLDER_CLUSTER_SCORE_PENALTY, DEFAULT_POOL_FEE_RATE, VOLUME_FEE_SCORE_PENALTY, ENABLE_PROBE_ENTRY } from '../config.js';
+import { evaluateHolderRisk } from '../shared/holder-risk.js';
+import { evaluateVolumeFeeRisk } from '../shared/volume-fee-risk.js';
+import { readNetworkCongestion } from '../shared/fee-oracle.js';
+import { resolveStrategyTier } from '../shared/strategy-tier.js';
+import { walletAlphaConfirmation } from '../shared/wallet-alpha.js';
 
 export function buildFeeSnapshot(fee, signature) {
   return {
@@ -30,6 +38,7 @@ export function signalLabel(signals = {}) {
 export function filterCandidate(candidate) {
   const strat = activeStrategy();
   const failures = [];
+  const scorePenalties = [];
   const mcap = candidate.metrics.marketCapUsd;
   const totalFees = candidate.metrics.gmgnTotalFeesSol;
   const gradVolume = candidate.metrics.graduatedVolumeUsd;
@@ -112,7 +121,49 @@ export function filterCandidate(candidate) {
     }
   }
 
-  return { passed: failures.length === 0, failures, strategy: strat.id };
+  const authorityRisk = candidate.risk?.authorityRisk;
+  const holderRisk = candidate.risk?.holderRisk;
+  const volumeFeeRisk = candidate.risk?.volumeFeeRisk;
+  const networkCongestion = candidate.risk?.networkCongestion;
+  const strategyTier = candidate.strategyTier;
+  const walletAlpha = candidate.risk?.walletAlpha;
+  if (ENABLE_TOKEN_AUTHORITY_GUARD && authorityRisk?.checkOk && REJECT_ACTIVE_MINT_AUTHORITY && authorityRisk.hasActiveMintAuthority) {
+    failures.push('active_mint_authority');
+  }
+  if (ENABLE_TOKEN_AUTHORITY_GUARD && authorityRisk?.checkOk && authorityRisk.hasActiveFreezeAuthority) {
+    scorePenalties.push({ key: 'active_freeze_authority', penalty: ACTIVE_FREEZE_AUTHORITY_SCORE_PENALTY });
+  }
+  if (holderRisk?.checked && holderRisk.hardReject) {
+    if (holderRisk.riskFlags.includes('fresh_funded_holders_above_max')) failures.push('fresh_funded_holders_above_max');
+    if (holderRisk.riskFlags.includes('holder_cluster_risk_above_max')) failures.push('holder_cluster_risk_above_max');
+  }
+  if (holderRisk?.checked && holderRisk.shouldPenalty) {
+    scorePenalties.push({ key: 'holder_cluster_risk', penalty: HOLDER_CLUSTER_SCORE_PENALTY });
+  }
+  if (volumeFeeRisk?.checked && volumeFeeRisk.hardReject) {
+    failures.push('volume_fee_health_below_reject');
+  }
+  if (volumeFeeRisk?.checked && volumeFeeRisk.shouldPenalty) {
+    scorePenalties.push({ key: 'low_volume_fee_health', penalty: VOLUME_FEE_SCORE_PENALTY });
+  }
+  if (networkCongestion?.checked && networkCongestion.action === 'skip_fresh_launch' && candidate.signals?.route?.includes('trending')) {
+    failures.push('network_congestion_fresh_launch_skip');
+  }
+  if (strategyTier?.rejected) {
+    failures.push('strategy_tier_rejected');
+  }
+  if (networkCongestion?.checked && networkCongestion.level === 'extreme') {
+    scorePenalties.push({ key: 'extreme_network_congestion', penalty: 0.15 });
+  } else if (networkCongestion?.checked && (networkCongestion.level === 'high' || networkCongestion.level === 'medium')) {
+    scorePenalties.push({ key: 'network_congestion', penalty: 0.05 });
+  }
+
+  if (walletAlpha?.enabled && walletAlpha?.confirmed) {
+    scorePenalties.push({ key: 'wallet_alpha_confirmation', penalty: -Number(walletAlpha.boost || 0) });
+  }
+  const tierMultiplier = Number(strategyTier?.tierConfig?.sizeMultiplier ?? 1);
+  const congestionMultiplier = Number(networkCongestion?.sizeMultiplier ?? 1);
+  return { passed: failures.length === 0, failures, strategy: strat.id, scorePenalties, suggestedSizeMultiplier: tierMultiplier * congestionMultiplier };
 }
 
 export async function buildCandidate({ mint, fee = null, signature = null, graduatedCoin = null, trendingToken = null, route }) {
@@ -132,6 +183,12 @@ export async function buildCandidate({ mint, fee = null, signature = null, gradu
     graduatedCoin?.marketCap,
     graduatedCoin?.usd_market_cap,
   );
+  const authority = ENABLE_TOKEN_AUTHORITY_GUARD
+    ? await readTokenAuthority(mint).catch((error) => ({ ok: false, error: error.message }))
+    : { ok: false, error: 'guard_disabled' };
+  const holderRisk = evaluateHolderRisk({ holders });
+  const walletAlpha = walletAlphaConfirmation({ holders });
+  const networkCongestion = await readNetworkCongestion().catch((error) => ({ checked: false, reason: error.message }));
   const signalRoute = route || [
     fee ? 'fee' : null,
     graduatedCoin ? 'graduated' : null,
@@ -155,6 +212,7 @@ export async function buildCandidate({ mint, fee = null, signature = null, gradu
       holderCount: Number(gmgn?.holder_count ?? jupiterAsset?.holderCount ?? trendingToken?.holder_count ?? graduatedCoin?.numHolders ?? 0),
       gmgnTotalFeesSol: Number(gmgn?.total_fee ?? jupiterAsset?.fees ?? 0),
       gmgnTradeFeesSol: Number(gmgn?.trade_fee ?? 0),
+      feeRateEstimate: Number(gmgn?.pool_fee_rate ?? DEFAULT_POOL_FEE_RATE),
       graduatedVolumeUsd: Number(graduatedCoin?.volume ?? 0),
       graduatedMarketCapUsd: Number(graduatedCoin?.marketCap ?? 0),
       trendingVolumeUsd: Number(trendingToken?.volume ?? 0),
@@ -184,8 +242,34 @@ export async function buildCandidate({ mint, fee = null, signature = null, gradu
     chart,
     savedWalletExposure,
     twitterNarrative,
+    risk: {
+      authorityRisk: {
+        checkOk: Boolean(authority?.ok),
+        hasActiveMintAuthority: Boolean(authority?.hasActiveMintAuthority),
+        hasActiveFreezeAuthority: Boolean(authority?.hasActiveFreezeAuthority),
+        mintAuthority: authority?.mintAuthority || null,
+        freezeAuthority: authority?.freezeAuthority || null,
+        ownerProgram: authority?.ownerProgram || null,
+        error: authority?.ok ? null : (authority?.error || null),
+      },
+      holderRisk,
+      networkCongestion,
+      walletAlpha,
+    },
     createdAtMs: now(),
+    entryMode: ENABLE_PROBE_ENTRY ? 'probe' : 'full',
   };
+  candidate.strategyTier = resolveStrategyTier(candidate);
+  candidate.tierConfig = candidate.strategyTier.tierConfig;
+  candidate.risk = {
+    ...candidate.risk,
+    volumeFeeRisk: evaluateVolumeFeeRisk(candidate),
+  };
+  candidate.observability = buildObservability(candidate, {
+    source: signalRoute || 'unknown',
+    entryMode: candidate?.entryMode || 'full',
+    strategyTier: strat.id,
+  });
   candidate.filters = filterCandidate(candidate);
   return candidate;
 }

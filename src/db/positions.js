@@ -1,5 +1,7 @@
 import { db } from './connection.js';
 import { now, json } from '../utils.js';
+import { withOpenPositionObservability } from '../shared/observability.js';
+import { ENABLE_PROBE_ENTRY, PROBE_ENTRY_PCT } from '../config.js';
 import { numSetting, boolSetting, setting, activeStrategy } from './settings.js';
 
 export function openPositions() {
@@ -28,15 +30,21 @@ export function allPositions(limit = 10) {
 
 export function createDryRunPosition(candidateId, candidate, decision, reason = 'llm_buy') {
   const strat = activeStrategy();
-  const sizeSol = strat.position_size_sol ?? numSetting('dry_run_buy_sol', 0.1);
+  const sizeSolBase = strat.position_size_sol ?? numSetting('dry_run_buy_sol', 0.1);
+  const plannedSizeSol = sizeSolBase * Number(candidate?.tierConfig?.sizeMultiplier ?? 1);
+  const probeMode = candidate?.entryMode === 'probe' && ENABLE_PROBE_ENTRY;
+  const sizeSol = probeMode ? plannedSizeSol * (PROBE_ENTRY_PCT / 100) : plannedSizeSol;
   const entryPrice = Number(candidate.metrics.priceUsd || 0) || null;
   const entryMcap = Number(candidate.metrics.marketCapUsd || candidate.metrics.graduatedMarketCapUsd || 0) || null;
-  const tp = Number(decision.suggested_tp_percent || strat.tp_percent || numSetting('default_tp_percent', 50));
-  const sl = Number(decision.suggested_sl_percent || strat.sl_percent || numSetting('default_sl_percent', -25));
+  const tierExit = candidate.tierConfig?.exitConfig || {};
+  const tp = Number(tierExit.tp1Pct ?? decision.suggested_tp_percent ?? strat.tp_percent ?? numSetting('default_tp_percent', 50));
+  const sl = -Math.abs(Number(tierExit.hardSlPct ?? Math.abs(decision.suggested_sl_percent ?? strat.sl_percent ?? numSetting('default_sl_percent', -25))));
   const trailingEnabled = (strat.trailing_enabled ?? boolSetting('default_trailing_enabled', true)) ? 1 : 0;
-  const trailingPercent = strat.trailing_percent ?? numSetting('default_trailing_percent', 20);
+  const trailingPercent = Number(tierExit.trailingStopPct ?? strat.trailing_percent ?? numSetting('default_trailing_percent', 20));
 
   return db.transaction(() => {
+    const openedAtMs = now();
+    const observability = withOpenPositionObservability(candidate.observability || {}, openedAtMs, entryMcap);
     const existing = db.prepare(`
       SELECT id FROM dry_run_positions WHERE mint = ? AND status = 'open' LIMIT 1
     `).get(candidate.token.mint);
@@ -52,7 +60,7 @@ export function createDryRunPosition(candidateId, candidate, decision, reason = 
       candidateId,
       candidate.token.mint,
       candidate.token.symbol,
-      now(),
+      openedAtMs,
       sizeSol,
       entryPrice,
       entryMcap,
@@ -65,13 +73,20 @@ export function createDryRunPosition(candidateId, candidate, decision, reason = 
       trailingPercent,
       decision.id || null,
       strat.id,
-      json({ candidate, decision, reason, strategy: strat.id }),
+      json({
+        candidate: { ...candidate, observability },
+        decision,
+        reason,
+        strategy: strat.id,
+        openedAtMs,
+        probe: probeMode ? { enabled: true, plannedSizeSol, probeEntryPct: PROBE_ENTRY_PCT, addDone: false } : { enabled: false },
+      }),
     );
     const positionId = Number(result.lastInsertRowid);
     db.prepare(`
       INSERT INTO dry_run_trades (position_id, mint, side, at_ms, price, mcap, size_sol, token_amount_est, reason, payload_json)
       VALUES (?, ?, 'buy', ?, ?, ?, ?, ?, ?, ?)
-    `).run(positionId, candidate.token.mint, now(), entryPrice, entryMcap, sizeSol, null, reason, json({ candidateId, decision }));
+    `).run(positionId, candidate.token.mint, now(), entryPrice, entryMcap, sizeSol, null, probeMode ? 'PROBE_ENTRY' : reason, json({ candidateId, decision, probe: probeMode }));
     db.prepare(`
       INSERT INTO tp_sl_rules (position_id, tp_percent, sl_percent, trailing_enabled, trailing_percent, updated_at_ms)
       VALUES (?, ?, ?, ?, ?, ?)
@@ -82,15 +97,21 @@ export function createDryRunPosition(candidateId, candidate, decision, reason = 
 
 export function createLivePosition(candidateId, candidate, decision, swap, reason = 'live_buy') {
   const strat = activeStrategy();
-  const sizeSol = strat.position_size_sol ?? numSetting('dry_run_buy_sol', 0.1);
+  const sizeSolBase = strat.position_size_sol ?? numSetting('dry_run_buy_sol', 0.1);
+  const plannedSizeSol = sizeSolBase * Number(candidate?.tierConfig?.sizeMultiplier ?? 1);
+  const probeMode = candidate?.entryMode === 'probe' && ENABLE_PROBE_ENTRY;
+  const sizeSol = probeMode ? plannedSizeSol * (PROBE_ENTRY_PCT / 100) : plannedSizeSol;
   const entryPrice = Number(candidate.metrics.priceUsd || 0) || null;
   const entryMcap = Number(candidate.metrics.marketCapUsd || candidate.metrics.graduatedMarketCapUsd || 0) || null;
-  const tp = Number(decision.suggested_tp_percent || strat.tp_percent || numSetting('default_tp_percent', 50));
-  const sl = Number(decision.suggested_sl_percent || strat.sl_percent || numSetting('default_sl_percent', -25));
+  const tierExit = candidate.tierConfig?.exitConfig || {};
+  const tp = Number(tierExit.tp1Pct ?? decision.suggested_tp_percent ?? strat.tp_percent ?? numSetting('default_tp_percent', 50));
+  const sl = -Math.abs(Number(tierExit.hardSlPct ?? Math.abs(decision.suggested_sl_percent ?? strat.sl_percent ?? numSetting('default_sl_percent', -25))));
   const trailingEnabled = (strat.trailing_enabled ?? boolSetting('default_trailing_enabled', true)) ? 1 : 0;
-  const trailingPercent = strat.trailing_percent ?? numSetting('default_trailing_percent', 20);
+  const trailingPercent = Number(tierExit.trailingStopPct ?? strat.trailing_percent ?? numSetting('default_trailing_percent', 20));
 
   return db.transaction(() => {
+    const openedAtMs = now();
+    const observability = withOpenPositionObservability(candidate.observability || {}, openedAtMs, entryMcap);
     const existing = db.prepare(`
       SELECT id FROM dry_run_positions WHERE mint = ? AND status = 'open' LIMIT 1
     `).get(candidate.token.mint);
@@ -107,7 +128,7 @@ export function createLivePosition(candidateId, candidate, decision, swap, reaso
       candidateId,
       candidate.token.mint,
       candidate.token.symbol,
-      now(),
+      openedAtMs,
       sizeSol,
       entryPrice,
       entryMcap,
@@ -122,13 +143,21 @@ export function createLivePosition(candidateId, candidate, decision, swap, reaso
       swap.signature,
       swap.outputAmount || null,
       strat.id,
-      json({ candidate, decision, reason, swap, strategy: strat.id }),
+      json({
+        candidate: { ...candidate, observability },
+        decision,
+        reason,
+        swap,
+        strategy: strat.id,
+        openedAtMs,
+        probe: probeMode ? { enabled: true, plannedSizeSol, probeEntryPct: PROBE_ENTRY_PCT, addDone: false } : { enabled: false },
+      }),
     );
     const positionId = Number(result.lastInsertRowid);
     db.prepare(`
       INSERT INTO dry_run_trades (position_id, mint, side, at_ms, price, mcap, size_sol, token_amount_est, reason, payload_json)
       VALUES (?, ?, 'buy', ?, ?, ?, ?, ?, ?, ?)
-    `).run(positionId, candidate.token.mint, now(), entryPrice, entryMcap, sizeSol, null, reason, json({ candidateId, decision, swap }));
+    `).run(positionId, candidate.token.mint, now(), entryPrice, entryMcap, sizeSol, null, probeMode ? 'PROBE_ENTRY' : reason, json({ candidateId, decision, swap, probe: probeMode }));
     db.prepare(`
       INSERT INTO tp_sl_rules (position_id, tp_percent, sl_percent, trailing_enabled, trailing_percent, updated_at_ms)
       VALUES (?, ?, ?, ?, ?, ?)
